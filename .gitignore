@@ -27,11 +27,24 @@ env/
 .idea/
 *.swp
 *.swo
+*.iml
 
 # Environment
 .env
 .env.local
+.env.development
 .env.production
+application-local.properties
+application-prod.properties
+*.pem
+*.key
+*.p12
+*.jks
+credentials.json
+service-account.json
+
+# Build output
+target/
 
 # Application data
 face_service.db
