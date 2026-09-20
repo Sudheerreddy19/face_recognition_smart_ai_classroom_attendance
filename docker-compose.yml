@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  docker-compose.yml – python-face-service
+#
+#  For DEPLOYMENT on Linux with ESP32-CAM.
+#  Do NOT use this for Windows development (webcam won't work in Docker).
+#
+#  Usage:
+#    cp .env.example .env          # fill in your real values
+#    docker-compose up -d
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+  face-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: face-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Camera source must be esp32 in Docker (no webcam access on Linux server)
+      - CAMERA_SOURCE=esp32
+    volumes:
+      # Persist encodings and logs outside the container
+      - ./encodings:/app/encodings
+      - ./logs:/app/logs
+      - ./uploads:/app/uploads
+    networks:
+      - smartclassroom
+
+  # Optional: include only if you want a local SQLite UI
+  # sqlite-web:
+  #   image: coleifer/sqlite-web
+  #   ports:
+  #     - "8080:8080"
+  #   volumes:
+  #     - ./face_service.db:/data/face_service.db
+  #   networks:
+  #     - smartclassroom
+
+networks:
+  smartclassroom:
+    driver: bridge
