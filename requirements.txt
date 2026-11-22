@@ -45,3 +45,7 @@ pydantic-settings>=2.4.0
 
 # ── Async Utilities ───────────────────────────────────────────
 aiofiles>=24.1.0
+
+# ── WebSocket Agent ──────────────────────────────────────────────────────────
+# Used by agent/ws_agent.py to connect outbound to Spring Boot on Render.
+websockets>=12.0

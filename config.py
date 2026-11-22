@@ -34,12 +34,15 @@ class Settings(BaseSettings):
     camera_source: str = "laptop"
     camera_index: int = 0
     esp32_camera_url: str = "http://192.168.1.100"   # override via .env
-    capture_count: int = 20
+    capture_count: int = 5
     frame_width: int = 640
     frame_height: int = 480
 
     # ── Face Recognition ──────────────────────────────────────────────────────
     recognition_threshold: float = 0.50
+    duplicate_match_threshold: float = 0.50     # distance threshold for duplicate detection
+    duplicate_uncertain_threshold: float = 0.60 # distance threshold for uncertain match zone
+    duplicate_min_match_ratio: float = 0.25     # min fraction of frames matching to declare duplicate
     detection_model: str = "hog"       # "hog" (CPU) or "cnn" (GPU)
     encoding_jitters: int = 1
 
@@ -57,6 +60,15 @@ class Settings(BaseSettings):
     spring_boot_attendance_endpoint: str = "/api/attendance/save"
     spring_boot_student_endpoint: str = "/api/students"
     spring_boot_timeout: int = 10
+
+    # ── WebSocket Agent (outbound connection to Render) ───────────────────────
+    # Set these in .env — the agent will not start if CLASSAI_AGENT_WS_URL is empty.
+    classai_agent_ws_url: str = ""          # wss://smart-ai-classroom-server.onrender.com/ws/agent
+    classai_agent_id: str = "laptop-agent-01"
+    classai_agent_token: str = ""           # shared secret — must match Render env var
+    agent_reconnect_interval: int = 5       # seconds between reconnect attempts
+    agent_heartbeat_interval: int = 20      # seconds between heartbeat pings
+    capture_job_timeout: int = 90           # max seconds to wait for camera capture
 
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = "INFO"

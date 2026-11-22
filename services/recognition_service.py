@@ -65,7 +65,7 @@ from schemas.recognize_response import RecognizeResponseDTO
 from services.camera_service import CameraService
 from services.detection_service import DetectionService
 from services.encoding_service import EncodingService
-from utils.constants import RecognitionStatus
+from utils.constants import DuplicateCheckOutcome, RecognitionStatus
 from utils.face_compat import face_distance
 from utils.image_utils import bgr_to_rgb
 from utils.logger import get_logger
@@ -382,6 +382,168 @@ class RecognitionService:
             status=RecognitionStatus.RECOGNIZED,
             recognition_time_ms=_elapsed_ms(t_start),
         )
+
+
+    # ── Duplicate Face Detection ──────────────────────────────────────────────
+
+    def check_duplicate_faces(
+        self,
+        new_encodings: list[np.ndarray],
+        target_student_id: str,
+        match_threshold: Optional[float] = None,
+        uncertain_threshold: Optional[float] = None,
+        min_match_ratio: Optional[float] = None,
+    ) -> dict:
+        """Compare newly captured face encodings against ALL enrolled students.
+
+        Outcomes:
+          - DUPLICATE_FOUND:
+              A confident match is found with another enrolled student.
+              Returns matched student's ID, distance, match count, and ratio.
+          - UNCERTAIN_MATCH:
+              Distances fall within the uncertain boundary [match_threshold, uncertain_threshold]
+              or multiple conflicting student candidates match. Requires recapture.
+          - NO_DUPLICATE:
+              No matches found against any other enrolled students. Safe to proceed.
+
+        Handles:
+          - Re-registration of the same student (target_student_id ignored).
+          - Multiple possible matching candidates.
+          - Empty / missing / corrupt encoding records.
+        """
+        if not new_encodings:
+            return {
+                "outcome": DuplicateCheckOutcome.NO_DUPLICATE,
+                "message": "No new encodings provided to check.",
+            }
+
+        m_thresh = match_threshold if match_threshold is not None else getattr(settings, "duplicate_match_threshold", self._threshold)
+        u_thresh = uncertain_threshold if uncertain_threshold is not None else getattr(settings, "duplicate_uncertain_threshold", 0.60)
+        ratio_thresh = min_match_ratio if min_match_ratio is not None else getattr(settings, "duplicate_min_match_ratio", 0.25)
+
+        # Ensure encodings are loaded (fresh load from disk)
+        all_existing = self._encoder.load_all_encodings()
+        if not all_existing:
+            logger.info("Duplicate check: No existing enrolled students found in database/disk.")
+            return {
+                "outcome": DuplicateCheckOutcome.NO_DUPLICATE,
+                "message": "No existing students enrolled.",
+            }
+
+        target_norm = str(target_student_id).strip().upper()
+        total_new = len(new_encodings)
+        min_matches_needed = max(2, int(total_new * ratio_thresh))
+
+        confident_matches = []
+        uncertain_matches = []
+
+        for other_sid, other_encs in all_existing.items():
+            if str(other_sid).strip().upper() == target_norm:
+                # Same student re-registering or updating face - ignore self
+                continue
+
+            if not other_encs:
+                continue
+
+            # Compare new encodings against this student's stored encodings
+            match_count = 0
+            uncertain_count = 0
+            min_dist = float("inf")
+
+            for new_enc in new_encodings:
+                try:
+                    dists = face_distance(other_encs, new_enc)
+                    if len(dists) == 0:
+                        continue
+                    best_d = float(np.min(dists))
+                    if best_d < min_dist:
+                        min_dist = best_d
+                    if best_d <= m_thresh:
+                        match_count += 1
+                    elif best_d <= u_thresh:
+                        uncertain_count += 1
+                except Exception as comp_err:
+                    logger.warning("Error comparing encodings for student %s: %s", other_sid, comp_err)
+                    continue
+
+            if match_count >= min_matches_needed:
+                confident_matches.append({
+                    "student_id": str(other_sid),
+                    "min_distance": min_dist,
+                    "matched_count": match_count,
+                    "total_frames": total_new,
+                    "match_ratio": match_count / total_new,
+                })
+            elif (match_count + uncertain_count) >= min_matches_needed and min_dist <= u_thresh:
+                uncertain_matches.append({
+                    "student_id": str(other_sid),
+                    "min_distance": min_dist,
+                    "matched_count": match_count,
+                    "uncertain_count": uncertain_count,
+                    "total_frames": total_new,
+                })
+
+        # Sort matches by best (lowest) distance
+        confident_matches.sort(key=lambda x: x["min_distance"])
+        uncertain_matches.sort(key=lambda x: x["min_distance"])
+
+        # Multiple conflicting confident matches:
+        if len(confident_matches) > 1:
+            logger.warning(
+                "Multiple confident duplicate candidates found for %s: %s",
+                target_student_id,
+                [m["student_id"] for m in confident_matches],
+            )
+            # Confident duplicate found - return top match with candidate list
+            top_match = confident_matches[0]
+            return {
+                "outcome": DuplicateCheckOutcome.DUPLICATE_FOUND,
+                "matched_student_id": top_match["student_id"],
+                "min_distance": top_match["min_distance"],
+                "matched_count": top_match["matched_count"],
+                "total_frames": top_match["total_frames"],
+                "all_candidates": [m["student_id"] for m in confident_matches],
+                "message": f"Duplicate face detected matching student {top_match['student_id']}.",
+            }
+
+        if len(confident_matches) == 1:
+            top_match = confident_matches[0]
+            logger.warning(
+                "Confident duplicate detected: %s matches %s (min_dist=%.3f, matches=%d/%d)",
+                target_student_id,
+                top_match["student_id"],
+                top_match["min_distance"],
+                top_match["matched_count"],
+                top_match["total_frames"],
+            )
+            return {
+                "outcome": DuplicateCheckOutcome.DUPLICATE_FOUND,
+                "matched_student_id": top_match["student_id"],
+                "min_distance": top_match["min_distance"],
+                "matched_count": top_match["matched_count"],
+                "total_frames": top_match["total_frames"],
+                "message": f"Duplicate face detected matching student {top_match['student_id']}.",
+            }
+
+        if len(uncertain_matches) > 0:
+            top_unc = uncertain_matches[0]
+            logger.info(
+                "Uncertain match for %s with %s (min_dist=%.3f). Recapture recommended.",
+                target_student_id,
+                top_unc["student_id"],
+                top_unc["min_distance"],
+            )
+            return {
+                "outcome": DuplicateCheckOutcome.UNCERTAIN_MATCH,
+                "candidate_student_id": top_unc["student_id"],
+                "min_distance": top_unc["min_distance"],
+                "message": "Match confidence is insufficient or lighting/angle unclear. Please improve lighting and camera position, then capture again.",
+            }
+
+        return {
+            "outcome": DuplicateCheckOutcome.NO_DUPLICATE,
+            "message": "No duplicate face found. Safe to register.",
+        }
 
 
 # ── Module-level helper ───────────────────────────────────────────────────────

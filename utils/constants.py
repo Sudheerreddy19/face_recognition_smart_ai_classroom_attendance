@@ -37,7 +37,7 @@ JPEG_QUALITY: int = 95
 POSE_LABELS: list[str] = ["front", "left", "right", "up", "down"]
 
 # Gap between automatic captures (frames to skip)
-CAPTURE_FRAME_GAP: int = 10
+CAPTURE_FRAME_GAP: int = 2
 
 # ── Encoding Files ────────────────────────────────────────────────────────────
 
@@ -81,3 +81,9 @@ class RecognitionStatus(str, Enum):
     NO_FACE = "NO_FACE"
     LOW_CONFIDENCE = "LOW_CONFIDENCE"
     MULTIPLE_FACES = "MULTIPLE_FACES"
+
+
+class DuplicateCheckOutcome(str, Enum):
+    DUPLICATE_FOUND = "DUPLICATE_FOUND"
+    NO_DUPLICATE = "NO_DUPLICATE"
+    UNCERTAIN_MATCH = "UNCERTAIN_MATCH"

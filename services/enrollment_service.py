@@ -66,7 +66,7 @@ settings = get_settings()
 # ── Quality thresholds (tunable) ──────────────────────────────────────────────
 
 # Laplacian variance below this → frame is too blurry
-_BLUR_THRESHOLD: float = 80.0
+_BLUR_THRESHOLD: float = 30.0
 
 # Face bounding box must be at least this fraction of frame area
 _MIN_FACE_FRACTION: float = MIN_FACE_AREA_FRACTION   # from constants (0.02)
@@ -230,28 +230,52 @@ class EnrollmentService:
         image_dir: Path,
         result: EnrollmentResult,
     ) -> None:
-        """Main frame-reading loop. Modifies *result* in-place.
-
-        Args:
-            student_id: Used for window title and file naming.
-            image_dir:  Directory to save captured images.
-            result:     EnrollmentResult to populate.
-        """
+        """Main frame-reading loop with Face Alignment HUD. Modifies *result* in-place."""
         frame_counter = 0
         fps_prev_time = time.time()
         fps = 0.0
-        window_title = f"Enrolling: {student_id}  (Q to cancel)"
+        window_title = f"Class AI Biometrics — Enrolling: {student_id}"
 
-        # Skip counters for diagnostics
+        if self._show_preview:
+            try:
+                cv2.namedWindow(window_title, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(window_title, 640, 480)
+                cv2.setWindowProperty(window_title, cv2.WND_PROP_TOPMOST, 1)
+                import ctypes
+                hwnd = ctypes.windll.user32.FindWindowW(None, window_title)
+                if hwnd:
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+                    ctypes.windll.user32.ShowWindow(hwnd, 5)
+            except Exception as win_err:
+                logger.debug("Window setup notice: %s", win_err)
+
         skipped: dict[str, int] = {
             "no_face": 0,
             "multiple_faces": 0,
             "too_small": 0,
             "blurry": 0,
             "frame_gap": 0,
+            "not_aligned": 0,
         }
 
+        loop_start_time = time.time()
+        max_duration = getattr(settings, "capture_job_timeout", 90) - 15  # 75s
+
         while result.images_captured < self._capture_count:
+            if time.time() - loop_start_time > max_duration:
+                logger.warning(
+                    "Enrollment capture timed out after %.1fs (captured %d/%d frames)",
+                    time.time() - loop_start_time,
+                    result.images_captured,
+                    self._capture_count,
+                )
+                result.error_code = "CAPTURE_TIMEOUT"
+                result.error_message = (
+                    f"Face capture timed out after {int(max_duration)}s. "
+                    "Ensure student looks directly into the camera inside the green guide."
+                )
+                break
+
             frame = self._camera.read_frame_with_retry(max_retries=3)
             if frame is None:
                 logger.warning("Failed to read frame — skipping")
@@ -269,214 +293,334 @@ class EnrollmentService:
             h, w = frame.shape[:2]
             rgb = bgr_to_rgb(frame)
 
-            # ── Detection on half-resolution for speed ─────────────────────
+            # Detection on half-resolution for speed
             small_rgb = cv2.resize(rgb, (w // 2, h // 2))
             locations_small = self._detector.detect_faces(small_rgb)
-            # Scale back to full resolution
-            locations = self._detector.scale_face_locations(
-                locations_small, scale=0.5
-            )
+            locations = self._detector.scale_face_locations(locations_small, scale=0.5)
 
             display = frame.copy()
-            draw_fps(display, fps)
-            draw_capture_progress(display, result.images_captured, self._capture_count)
-
-            # ── Guard: exactly one face ────────────────────────────────────
             face_count = len(locations)
 
+            # ── Guard: No face detected ─────────────────────────────────────
             if face_count == 0:
                 skipped["no_face"] += 1
-                self._overlay_status(display, "NO FACE DETECTED", RECT_COLOR_UNKNOWN)
+                self._draw_alignment_hud(
+                    display, student_id, locations,
+                    status_text="POSITION FACE INSIDE OVAL GUIDE",
+                    status_color=(200, 200, 200),
+                    oval_color=(180, 180, 180),
+                    captured=result.images_captured,
+                    target=self._capture_count,
+                    fps=fps,
+                )
                 self._show_frame(window_title, display)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     logger.warning("Enrollment cancelled by user")
                     break
                 continue
 
+            # ── Guard: Multiple faces ───────────────────────────────────────
             if face_count > 1:
                 skipped["multiple_faces"] += 1
-                self._overlay_status(
-                    display,
-                    f"MULTIPLE FACES ({face_count}) — only one person please",
-                    RECT_COLOR_UNKNOWN,
+                self._draw_alignment_hud(
+                    display, student_id, locations,
+                    status_text=f"MULTIPLE FACES ({face_count}) — ONLY 1 PERSON",
+                    status_color=(0, 0, 255),
+                    oval_color=(0, 0, 255),
+                    captured=result.images_captured,
+                    target=self._capture_count,
+                    fps=fps,
                 )
-                # Draw all rectangles in red
-                for top, right, bottom, left in locations:
-                    cv2.rectangle(display, (left, top), (right, bottom),
-                                  RECT_COLOR_UNKNOWN, 2)
                 self._show_frame(window_title, display)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
                 continue
 
-            # Exactly one face
+            # ── Exactly one face — verify alignment ─────────────────────────
             top, right, bottom, left = locations[0]
+            face_cx = (left + right) // 2
+            face_cy = (top + bottom) // 2
             face_h = bottom - top
-            face_w = right - left
-            face_area = face_h * face_w
-            frame_area = h * w
+            guide_cx, guide_cy = w // 2, int(h * 0.48)
 
-            # ── Guard: face too small ──────────────────────────────────────
-            if (face_area / frame_area) < _MIN_FACE_FRACTION:
-                skipped["too_small"] += 1
-                cv2.rectangle(display, (left, top), (right, bottom),
-                              RECT_COLOR_DETECTING, 2)
-                self._overlay_status(
-                    display, "MOVE CLOSER — face too small", RECT_COLOR_DETECTING
+            dx = face_cx - guide_cx
+            dy = face_cy - guide_cy
+
+            # Check horizontal centering
+            if abs(dx) > 65:
+                skipped["not_aligned"] += 1
+                msg = "MOVE LEFT ←" if dx > 0 else "MOVE RIGHT →"
+                self._draw_alignment_hud(
+                    display, student_id, locations,
+                    status_text=f"ALIGNMENT: {msg}",
+                    status_color=(0, 165, 255),
+                    oval_color=(0, 165, 255),
+                    captured=result.images_captured,
+                    target=self._capture_count,
+                    fps=fps,
                 )
                 self._show_frame(window_title, display)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
                 continue
 
-            if face_h < _MIN_FACE_HEIGHT_PX:
-                skipped["too_small"] += 1
-                cv2.rectangle(display, (left, top), (right, bottom),
-                              RECT_COLOR_DETECTING, 2)
-                self._overlay_status(
-                    display, "MOVE CLOSER — face height too small",
-                    RECT_COLOR_DETECTING
+            # Check vertical centering
+            if abs(dy) > 65:
+                skipped["not_aligned"] += 1
+                msg = "MOVE UP ↑" if dy > 0 else "MOVE DOWN ↓"
+                self._draw_alignment_hud(
+                    display, student_id, locations,
+                    status_text=f"ALIGNMENT: {msg}",
+                    status_color=(0, 165, 255),
+                    oval_color=(0, 165, 255),
+                    captured=result.images_captured,
+                    target=self._capture_count,
+                    fps=fps,
                 )
                 self._show_frame(window_title, display)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
                 continue
 
-            # ── Guard: blur check ──────────────────────────────────────────
-            face_roi_gray = cv2.cvtColor(
-                frame[top:bottom, left:right], cv2.COLOR_BGR2GRAY
-            )
+            # Check distance (face size)
+            if face_h < 120:
+                skipped["too_small"] += 1
+                self._draw_alignment_hud(
+                    display, student_id, locations,
+                    status_text="ALIGNMENT: MOVE CLOSER TO CAMERA",
+                    status_color=(0, 215, 255),
+                    oval_color=(0, 215, 255),
+                    captured=result.images_captured,
+                    target=self._capture_count,
+                    fps=fps,
+                )
+                self._show_frame(window_title, display)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                continue
+
+            if face_h > 360:
+                self._draw_alignment_hud(
+                    display, student_id, locations,
+                    status_text="ALIGNMENT: MOVE BACK SLIGHTLY",
+                    status_color=(0, 215, 255),
+                    oval_color=(0, 215, 255),
+                    captured=result.images_captured,
+                    target=self._capture_count,
+                    fps=fps,
+                )
+                self._show_frame(window_title, display)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                continue
+
+            # Check blur
+            face_roi_gray = cv2.cvtColor(frame[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
             blur_score = cv2.Laplacian(face_roi_gray, cv2.CV_64F).var()
-
             if blur_score < self._blur_threshold:
                 skipped["blurry"] += 1
-                cv2.rectangle(display, (left, top), (right, bottom),
-                              RECT_COLOR_DETECTING, 2)
-                self._overlay_status(
-                    display,
-                    f"BLURRY (score={blur_score:.0f}) — hold still",
-                    RECT_COLOR_DETECTING,
+                self._draw_alignment_hud(
+                    display, student_id, locations,
+                    status_text=f"HOLD STILL (Blur={blur_score:.0f})",
+                    status_color=(0, 215, 255),
+                    oval_color=(0, 215, 255),
+                    captured=result.images_captured,
+                    target=self._capture_count,
+                    fps=fps,
                 )
                 self._show_frame(window_title, display)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
                 continue
 
-            # ── Guard: frame gap (don't capture every single frame) ────────
+            # Face is ALIGNED and SHARP — apply frame gap
             if frame_counter % CAPTURE_FRAME_GAP != 0:
                 skipped["frame_gap"] += 1
-                cv2.rectangle(display, (left, top), (right, bottom),
-                              RECT_COLOR_KNOWN, 2)
-                self._overlay_status(
-                    display,
-                    f"GOOD — capturing {result.images_captured}/{self._capture_count}",
-                    RECT_COLOR_KNOWN,
+                self._draw_alignment_hud(
+                    display, student_id, locations,
+                    status_text=f"FACE ALIGNED ✓ CAPTURING ({result.images_captured}/{self._capture_count})",
+                    status_color=(34, 197, 94),
+                    oval_color=(34, 197, 94),
+                    captured=result.images_captured,
+                    target=self._capture_count,
+                    fps=fps,
                 )
                 self._show_frame(window_title, display)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
                 continue
 
-            # ── CAPTURE ────────────────────────────────────────────────────
+            # ── CAPTURE FRAME ───────────────────────────────────────────────
             pose_label = POSE_LABELS[result.images_captured % len(POSE_LABELS)]
-            filename = (
-                f"{student_id}_{result.images_captured:03d}"
-                f"_{pose_label}{IMAGE_EXTENSION}"
-            )
+            filename = f"{student_id}_{result.images_captured:03d}_{pose_label}{IMAGE_EXTENSION}"
             save_path = image_dir / filename
-
             try:
                 save_frame(frame, save_path, quality=JPEG_QUALITY)
                 result.saved_paths.append(save_path)
                 result.images_captured += 1
                 logger.debug(
                     "Captured frame %d/%d for student %s (blur=%.1f)",
-                    result.images_captured,
-                    self._capture_count,
-                    student_id,
-                    blur_score,
+                    result.images_captured, self._capture_count, student_id, blur_score,
                 )
             except Exception as exc:
                 logger.warning("Failed to save frame: %s", exc)
                 continue
 
-            # Flash the bounding box green on capture
-            cv2.rectangle(display, (left, top), (right, bottom),
-                          RECT_COLOR_KNOWN, 3)
-            self._overlay_status(
-                display,
-                f"CAPTURED {result.images_captured}/{self._capture_count}  "
-                f"blur={blur_score:.0f}",
-                RECT_COLOR_KNOWN,
+            self._draw_alignment_hud(
+                display, student_id, locations,
+                status_text=f"CAPTURED {result.images_captured}/{self._capture_count} ✓ HOLD STILL",
+                status_color=(34, 197, 94),
+                oval_color=(34, 197, 94),
+                captured=result.images_captured,
+                target=self._capture_count,
+                fps=fps,
             )
             self._show_frame(window_title, display)
             if cv2.waitKey(1) & 0xFF == ord("q"):
-                logger.warning("Enrollment cancelled by user after capture")
                 break
 
         result.skipped_frames = skipped
         logger.info(
-            "Capture loop complete – student=%s frames_skipped=%s",
-            student_id,
-            skipped,
+            "Capture loop complete — student=%s frames_skipped=%s",
+            student_id, skipped,
         )
 
-    def _generate_encodings(self, result: EnrollmentResult) -> None:
-        """Generate face encodings from all captured images in *result*.
-
-        Reads saved JPEG files, generates encodings via EncodingService,
-        and populates ``result.encodings``.
-
-        Args:
-            result: EnrollmentResult with populated ``saved_paths``.
-        """
-        from utils.image_utils import load_image_as_rgb
-
-        encodings: list[np.ndarray] = []
-        failed = 0
-
-        for path in result.saved_paths:
-            try:
-                rgb = load_image_as_rgb(path)
-                enc = self._encoder.encode_face(rgb)
-                if enc is not None:
-                    encodings.append(enc)
-                else:
-                    failed += 1
-                    logger.debug("No encoding from %s", path.name)
-            except Exception as exc:
-                failed += 1
-                logger.warning("Error encoding %s: %s", path.name, exc)
-
-        result.encodings = encodings
-        logger.info(
-            "Encoding generation complete – student=%s encodings=%d failed=%d",
-            result.student_id,
-            len(encodings),
-            failed,
-        )
-
-    # ── Display helpers ───────────────────────────────────────────────────────
-
-    @staticmethod
-    def _overlay_status(
+    def _draw_alignment_hud(
+        self,
         frame: np.ndarray,
-        text: str,
-        color: tuple[int, int, int],
+        student_id: str,
+        locations: list[tuple[int, int, int, int]],
+        status_text: str,
+        status_color: tuple[int, int, int],
+        oval_color: tuple[int, int, int],
+        captured: int,
+        target: int,
+        fps: float = 0.0,
     ) -> None:
-        """Draw a status message in the bottom-left of *frame* in-place."""
-        h = frame.shape[0]
+        """Draw biometric face alignment HUD overlay on *frame*."""
+        h, w = frame.shape[:2]
+        guide_center = (w // 2, int(h * 0.48))  # (320, 230)
+        guide_axes   = (115, 155)
+
+        # 1. Top dark banner
+        cv2.rectangle(frame, (0, 0), (w, 44), (20, 20, 20), -1)
         cv2.putText(
             frame,
-            text,
-            (10, h - 15),
+            f"CLASS AI BIOMETRICS | Student: {student_id}",
+            (15, 28),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            color,
+            0.62,
+            (255, 255, 255),
             2,
         )
+        if fps > 0:
+            cv2.putText(
+                frame,
+                f"{int(fps)} FPS",
+                (w - 85, 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (160, 160, 160),
+                1,
+            )
+
+        # 2. Draw face box with corner accents if 1 face detected
+        if len(locations) == 1:
+            top, right, bottom, left = locations[0]
+            cv2.rectangle(frame, (left, top), (right, bottom), oval_color, 2)
+            corner_len = 16
+            cv2.line(frame, (left, top), (left + corner_len, top), (255, 255, 255), 3)
+            cv2.line(frame, (left, top), (left, top + corner_len), (255, 255, 255), 3)
+            cv2.line(frame, (right, top), (right - corner_len, top), (255, 255, 255), 3)
+            cv2.line(frame, (right, top), (right, top + corner_len), (255, 255, 255), 3)
+            cv2.line(frame, (left, bottom), (left + corner_len, bottom), (255, 255, 255), 3)
+            cv2.line(frame, (left, bottom), (left, bottom - corner_len), (255, 255, 255), 3)
+            cv2.line(frame, (right, bottom), (right - corner_len, bottom), (255, 255, 255), 3)
+            cv2.line(frame, (right, bottom), (right, bottom - corner_len), (255, 255, 255), 3)
+
+        # 3. Biometric guide oval
+        cv2.ellipse(frame, guide_center, guide_axes, 0, 0, 360, oval_color, 3)
+        cx, cy = guide_center
+        ax, ay = guide_axes
+        cv2.line(frame, (cx - 12, cy - ay), (cx + 12, cy - ay), (255, 255, 255), 2)
+        cv2.line(frame, (cx - 12, cy + ay), (cx + 12, cy + ay), (255, 255, 255), 2)
+        cv2.line(frame, (cx - ax, cy - 12), (cx - ax, cy + 12), (255, 255, 255), 2)
+        cv2.line(frame, (cx + ax, cy - 12), (cx + ax, cy + 12), (255, 255, 255), 2)
+
+        # 4. Bottom status bar
+        cv2.rectangle(frame, (0, h - 50), (w, h), (18, 18, 18), -1)
+        cv2.putText(
+            frame,
+            status_text,
+            (20, h - 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            status_color,
+            2,
+        )
+
+        # Progress bar
+        bar_x, bar_y, bar_w, bar_h = w - 210, h - 34, 190, 18
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (50, 50, 50), -1)
+        progress = min(1.0, captured / max(1, target))
+        fill_w = int(bar_w * progress)
+        if fill_w > 0:
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), (34, 197, 94), -1)
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (100, 100, 100), 1)
+        cv2.putText(
+            frame,
+            f"{captured}/{target}",
+            (bar_x + 72, bar_y + 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (255, 255, 255),
+            1,
+        )
+
+    def _overlay_status(self, frame: np.ndarray, text: str, color: tuple[int, int, int]) -> None:
+        """Deprecated compatibility overlay."""
+        pass
 
     def _show_frame(self, window_title: str, frame: np.ndarray) -> None:
         """Display *frame* if preview is enabled."""
         if self._show_preview:
-            cv2.imshow(window_title, frame)
+            try:
+                cv2.imshow(window_title, frame)
+            except Exception:
+                pass
+
+    def _generate_encodings(self, result: EnrollmentResult) -> None:
+        """Generate face encodings in parallel from captured images.
+
+        Uses a ThreadPoolExecutor to encode frames concurrently across CPU cores
+        for fast completion within 5 to 10 seconds.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        from utils.image_utils import load_image_as_rgb
+
+        def _encode_single(path):
+            try:
+                rgb = load_image_as_rgb(path)
+                return self._encoder.encode_face(rgb)
+            except Exception as exc:
+                logger.warning("Error encoding %s: %s", path.name, exc)
+                return None
+
+        paths = list(result.saved_paths)
+        if not paths:
+            result.encodings = []
+            return
+
+        with ThreadPoolExecutor(max_workers=min(len(paths), 4)) as pool:
+            raw_results = list(pool.map(_encode_single, paths))
+
+        encodings = [enc for enc in raw_results if enc is not None]
+        failed = len(paths) - len(encodings)
+
+        result.encodings = encodings
+        logger.info(
+            "Encoding generation complete (parallel) – student=%s encodings=%d failed=%d",
+            result.student_id,
+            len(encodings),
+            failed,
+        )

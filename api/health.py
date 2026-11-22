@@ -13,6 +13,8 @@ import asyncio
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 from datetime import datetime
+from typing import Optional
+import agent.ws_agent as ws_agent
 
 from services.camera_service import CameraService
 from services.springboot_service import SpringBootService
@@ -31,6 +33,8 @@ class HealthResponse(BaseModel):
     encodings_loaded: int
     service: str = "FACE RECOGNITION"
     timestamp: datetime = Field(default_factory=datetime.now)
+    agent_connected: bool = False
+    agent_id: str = "laptop-agent-01"
 
 
 @router.get(
@@ -68,6 +72,7 @@ async def health_check() -> HealthResponse:
         camera=CameraStatus.CONNECTED if cam_ok else CameraStatus.DISCONNECTED,
         spring_boot="REACHABLE" if spring_ok else "UNREACHABLE",
         encodings_loaded=len(enc_infos),
+        agent_connected=ws_agent.agent_connected,
     )
 
     logger.info(

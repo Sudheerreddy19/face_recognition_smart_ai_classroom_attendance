@@ -49,8 +49,9 @@ from services.camera_service import CameraService
 from services.detection_service import DetectionService
 from services.encoding_service import EncodingService
 from services.enrollment_service import EnrollmentService
+from services.recognition_service import RecognitionService
 from services.springboot_service import SpringBootService
-from utils.constants import MSG_REGISTRATION_SUCCESS
+from utils.constants import DuplicateCheckOutcome, MSG_REGISTRATION_SUCCESS
 from utils.logger import get_logger
 
 router = APIRouter(tags=["Registration"])
@@ -61,6 +62,11 @@ settings = get_settings()
 _camera_svc = CameraService()
 _detector = DetectionService()
 _encoder = EncodingService()
+_recognition_svc = RecognitionService(
+    camera_service=_camera_svc,
+    detection_service=_detector,
+    encoding_service=_encoder,
+)
 _student_repo = EncodingRepository()
 _spring_svc = SpringBootService()
 
@@ -187,6 +193,68 @@ async def face_capture(
             "registerNumber": register_number,
             "studentDbId": student_db_id,
         }
+
+    # ── Duplicate Face Verification ─────────────────────────────────────────
+    # Before saving any encoding, verify against all enrolled students
+    try:
+        dup_result = _recognition_svc.check_duplicate_faces(
+            new_encodings=result.encodings,
+            target_student_id=register_number,
+        )
+        outcome = dup_result.get("outcome")
+
+        if outcome == DuplicateCheckOutcome.DUPLICATE_FOUND:
+            other_sid = dup_result.get("matched_student_id")
+            min_dist = dup_result.get("min_distance", 0.0)
+            matched_count = dup_result.get("matched_count", 0)
+
+            existing_name = other_sid
+            existing_dept = ""
+            existing_sem = ""
+            existing_s = _student_repo.get_student_by_id(db, other_sid)
+            if existing_s:
+                existing_name = existing_s.name or other_sid
+                existing_dept = existing_s.department or ""
+                existing_sem = existing_s.semester or ""
+
+            dept_str = f" | Dept: {existing_dept}" if existing_dept else ""
+            sem_str  = f" | Sem: {existing_sem}" if existing_sem else ""
+
+            logger.warning(
+                "DUPLICATE_FOUND: New roll '%s' matches existing student '%s' (%s, min_dist=%.3f, matches=%d/%d)",
+                register_number, other_sid, existing_name, min_dist, matched_count, len(result.encodings),
+            )
+
+            return {
+                "success": False,
+                "errorCode": "DUPLICATE_FACE",
+                "message": (
+                    f"DUPLICATE FACE DETECTED! This face is ALREADY registered to "
+                    f"{existing_name} (Roll: {other_sid}{dept_str}{sem_str}). "
+                    "A face cannot be registered under multiple roll numbers."
+                ),
+                "existingStudent": {
+                    "rollNumber": other_sid,
+                    "name": existing_name,
+                    "department": existing_dept,
+                    "semester": existing_sem,
+                },
+                "registerNumber": register_number,
+                "studentDbId": student_db_id,
+            }
+
+        elif outcome == DuplicateCheckOutcome.UNCERTAIN_MATCH:
+            logger.info("UNCERTAIN_MATCH for student %s", register_number)
+            return {
+                "success": False,
+                "errorCode": "UNCERTAIN_MATCH",
+                "message": dup_result.get("message", "Match confidence is insufficient. Please adjust camera position, improve lighting, and try again."),
+                "registerNumber": register_number,
+                "studentDbId": student_db_id,
+            }
+
+    except Exception as dup_err:
+        logger.exception("Duplicate check error: %s", dup_err)
 
     # Persist student metadata to local SQLite (only if not already there)
     if not already_enrolled:

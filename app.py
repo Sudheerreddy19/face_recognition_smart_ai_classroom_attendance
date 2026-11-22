@@ -10,6 +10,7 @@ Or via the startup helper:
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -38,7 +39,24 @@ settings = get_settings()
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application startup and shutdown tasks."""
     run_startup()
+
+    # ── Start WebSocket agent (outbound to Spring Boot on Render) ─────────────
+    # The agent connects outbound so Spring Boot can dispatch face-capture jobs
+    # to this local Python service without exposing port 8000 publicly.
+    # If CLASSAI_AGENT_WS_URL / CLASSAI_AGENT_TOKEN are not set, the agent
+    # logs a warning and exits immediately — all other features keep working.
+    from agent.ws_agent import run_agent
+    _agent_task = asyncio.create_task(run_agent(), name="ws-agent")
+    logger.info("WebSocket agent task started")
+
     yield
+
+    # ── Graceful shutdown ─────────────────────────────────────────────────────
+    _agent_task.cancel()
+    try:
+        await _agent_task
+    except asyncio.CancelledError:
+        pass
     run_shutdown()
 
 
