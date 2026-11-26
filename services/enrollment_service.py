@@ -66,7 +66,7 @@ settings = get_settings()
 # ── Quality thresholds (tunable) ──────────────────────────────────────────────
 
 # Laplacian variance below this → frame is too blurry
-_BLUR_THRESHOLD: float = 30.0
+_BLUR_THRESHOLD: float = 15.0
 
 # Face bounding box must be at least this fraction of frame area
 _MIN_FACE_FRACTION: float = MIN_FACE_AREA_FRACTION   # from constants (0.02)
@@ -347,7 +347,7 @@ class EnrollmentService:
             dy = face_cy - guide_cy
 
             # Check horizontal centering
-            if abs(dx) > 65:
+            if abs(dx) > 130:
                 skipped["not_aligned"] += 1
                 msg = "MOVE LEFT ←" if dx > 0 else "MOVE RIGHT →"
                 self._draw_alignment_hud(
@@ -365,7 +365,7 @@ class EnrollmentService:
                 continue
 
             # Check vertical centering
-            if abs(dy) > 65:
+            if abs(dy) > 130:
                 skipped["not_aligned"] += 1
                 msg = "MOVE UP ↑" if dy > 0 else "MOVE DOWN ↓"
                 self._draw_alignment_hud(
@@ -383,7 +383,7 @@ class EnrollmentService:
                 continue
 
             # Check distance (face size)
-            if face_h < 120:
+            if face_h < 90:
                 skipped["too_small"] += 1
                 self._draw_alignment_hud(
                     display, student_id, locations,

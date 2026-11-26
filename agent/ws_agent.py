@@ -436,7 +436,8 @@ async def _run_attendance_loop(ws, session_id: int, job_id: str) -> None:
                 await asyncio.sleep(0.5)
                 continue
 
-            frame = await asyncio.to_thread(camera_svc.read_frame)
+            frame_res = await asyncio.to_thread(camera_svc.read_frame)
+            frame = frame_res[1] if isinstance(frame_res, tuple) else frame_res
             if frame is None:
                 await asyncio.sleep(0.05)
                 continue
@@ -535,8 +536,8 @@ async def _run_connection(ws_url: str, agent_id: str, token: str) -> None:
     try:
         async with websockets.connect(
             ws_url,
-            ping_interval=20,         # Send standard WS ping every 20s to prevent Render drops
-            ping_timeout=20,
+            ping_interval=10,         # Send standard WS ping every 20s to prevent Render drops
+            ping_timeout=10,
             open_timeout=25,
             close_timeout=10,
             additional_headers={"X-Agent-Id": agent_id},

@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     classai_agent_id: str = "laptop-agent-01"
     classai_agent_token: str = ""           # shared secret — must match Render env var
     agent_reconnect_interval: int = 5       # seconds between reconnect attempts
-    agent_heartbeat_interval: int = 20      # seconds between heartbeat pings
+    agent_heartbeat_interval: int = 10      # seconds between heartbeat pings
     capture_job_timeout: int = 90           # max seconds to wait for camera capture
 
     # ── Logging ───────────────────────────────────────────────────────────────
