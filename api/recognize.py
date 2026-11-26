@@ -215,3 +215,53 @@ async def reload_encodings() -> dict:
         "message": f"Encoding cache refreshed. {count} student(s) loaded.",
         "students_loaded": count,
     }
+
+
+from fastapi import UploadFile, File
+import cv2
+import numpy as np
+
+@router.post(
+    "/recognize/frame",
+    summary="Identify students from an uploaded image frame",
+    description="Accepts a camera snapshot (JPEG/PNG) from the browser, recognizes all faces, and returns the matches."
+)
+async def recognize_uploaded_frame(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    try:
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise HTTPException(status_code=400, detail="Invalid image file")
+
+        from utils.image_utils import bgr_to_rgb
+        rgb = bgr_to_rgb(bgr)
+
+        # Run multi-face recognition
+        dtos = await asyncio.to_thread(_recognizer.recognize_multiple_from_frame, rgb)
+
+        recognized_students = []
+        for dto in dtos:
+            if dto.status == RecognitionStatus.RECOGNIZED and dto.student_id:
+                student = _student_repo.get_student_by_id(db, dto.student_id)
+                recognized_students.append({
+                    "recognized": True,
+                    "rollNumber": dto.student_id,
+                    "name": student.name if student else dto.student_id,
+                    "distance": float(dto.distance or 0.0),
+                    "department": student.department if student else "",
+                    "semester": student.semester if student else "",
+                })
+
+        return {
+            "success": True,
+            "faceCount": len(dtos),
+            "recognizedCount": len(recognized_students),
+            "students": recognized_students,
+        }
+    except Exception as exc:
+        logger.exception("Error in recognize_uploaded_frame: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
