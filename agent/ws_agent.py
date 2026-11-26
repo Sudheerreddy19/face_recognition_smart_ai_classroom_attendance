@@ -108,6 +108,7 @@ async def _handle_capture_job(job: dict[str, Any]) -> dict[str, Any]:
     department      = job.get("department", "")
     semester        = job.get("semester", "")
     teacher_id      = job.get("teacherId")
+    camera_index    = job.get("cameraIndex")
 
     logger.info(
         "[WS-AGENT] CAPTURE_JOB received — jobId=%s student=%s name=%s",
@@ -146,6 +147,7 @@ async def _handle_capture_job(job: dict[str, Any]) -> dict[str, Any]:
             student_name=student_name,
             department=department,
             semester=semester,
+        camera_index=camera_index,
         )
     except Exception as exc:
         logger.exception("[WS-AGENT] Enrollment raised unexpected exception: %s", exc)
@@ -189,6 +191,7 @@ def _run_enrollment_sync(
     student_name: str,
     department: str,
     semester: str,
+    camera_index: Optional[int] = None,
 ) -> dict[str, Any]:
     """
     Synchronous enrollment pipeline — runs in a thread pool.
@@ -205,7 +208,7 @@ def _run_enrollment_sync(
     from services.recognition_service import RecognitionService
     from utils.constants import DuplicateCheckOutcome
 
-    camera_svc  = CameraService()
+    camera_svc  = CameraService(camera_index=camera_index)
     detector    = DetectionService()
     encoder_svc = EncodingService()
     recognition_svc = RecognitionService(
@@ -367,6 +370,148 @@ def _run_enrollment_sync(
 
 # ── WebSocket connection loop ─────────────────────────────────────────────────
 
+
+# ── Attendance Session State & Loop ──────────────────────────────────────────
+_active_attendance_task: Optional[asyncio.Task] = None
+_attendance_running: bool = False
+_attendance_paused: bool = False
+_active_session_id: Optional[int] = None
+_active_job_id: Optional[str] = None
+_recognized_students: set[str] = set()
+
+
+async def _run_attendance_loop(ws, session_id: int, job_id: str) -> None:
+    """
+    Continuous live attendance recognition loop.
+    Captures frames from camera, detects faces, compares with enrolled pickle encodings,
+    and sends RECOGNITION_EVENT or UNKNOWN_FACE_EVENT to Spring Boot.
+    """
+    global _attendance_running, _attendance_paused
+    from services.camera_service import CameraService
+    from services.recognition_service import RecognitionService
+    from services.detection_service import DetectionService
+    from services.encoding_service import EncodingService
+    from utils.constants import RecognitionStatus
+    import numpy as np
+
+    logger.info("[ATTENDANCE-LOOP] Starting live attendance recognition for session=%s", session_id)
+    camera_svc = CameraService()
+    detector = DetectionService()
+    encoder_svc = EncodingService()
+    recognizer = RecognitionService(
+        camera_service=camera_svc,
+        detection_service=detector,
+        encoding_service=encoder_svc,
+    )
+    recognizer.reload_encodings()
+
+    if not camera_svc.open():
+        logger.error("[ATTENDANCE-LOOP] Failed to open camera for attendance")
+        try:
+            await ws.send(json.dumps({
+                "type": "CAMERA_STATUS",
+                "status": "ERROR",
+                "message": "Webcam could not be opened by attendance agent."
+            }))
+        except Exception:
+            pass
+        return
+
+    try:
+        # Notify backend camera is live
+        await ws.send(json.dumps({
+            "type": "CAMERA_STATUS",
+            "status": "OPEN",
+            "message": "Attendance camera scanning active."
+        }))
+    except Exception:
+        pass
+
+    frame_count = 0
+    unknown_reported_time = 0.0
+
+    try:
+        while _attendance_running:
+            if _attendance_paused:
+                await asyncio.sleep(0.5)
+                continue
+
+            frame = await asyncio.to_thread(camera_svc.read_frame)
+            if frame is None:
+                await asyncio.sleep(0.05)
+                continue
+
+            frame_count += 1
+            # Run recognition every 3 frames for high responsiveness and low CPU load
+            if frame_count % 3 != 0:
+                await asyncio.sleep(0.01)
+                continue
+
+            from utils.image_utils import bgr_to_rgb
+            rgb_frame = bgr_to_rgb(frame)
+
+            # Recognize all visible faces in this frame
+            try:
+                results = await asyncio.to_thread(recognizer.recognize_multiple_from_frame, rgb_frame)
+            except Exception as e:
+                logger.debug("[ATTENDANCE-LOOP] Error during recognition: %s", e)
+                results = []
+
+            for dto in results:
+                if dto.status == RecognitionStatus.RECOGNIZED and dto.student_id:
+                    roll = str(dto.student_id)
+                    if roll not in _recognized_students:
+                        _recognized_students.add(roll)
+                        logger.info("[ATTENDANCE-LOOP] RECOGNIZED student: %s (dist=%.3f)", roll, dto.distance or 0.0)
+                        evt = {
+                            "type": "RECOGNITION_EVENT",
+                            "sessionId": session_id,
+                            "jobId": job_id,
+                            "rollNumber": roll,
+                            "confidence": float(dto.distance or 0.0),
+                        }
+                        try:
+                            await ws.send(json.dumps(evt))
+                        except Exception as send_err:
+                            logger.error("[ATTENDANCE-LOOP] Error sending RECOGNITION_EVENT: %s", send_err)
+
+                elif dto.status == RecognitionStatus.UNKNOWN:
+                    now = time.time()
+                    if now - unknown_reported_time > 8.0:
+                        unknown_reported_time = now
+                        logger.info("[ATTENDANCE-LOOP] UNKNOWN face detected in attendance session %s", session_id)
+                        evt = {
+                            "type": "UNKNOWN_FACE_EVENT",
+                            "sessionId": session_id,
+                            "jobId": job_id,
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        }
+                        try:
+                            await ws.send(json.dumps(evt))
+                        except Exception:
+                            pass
+
+            await asyncio.sleep(0.05)
+
+    except asyncio.CancelledError:
+        logger.info("[ATTENDANCE-LOOP] Attendance task cancelled")
+    except Exception as exc:
+        logger.exception("[ATTENDANCE-LOOP] Unexpected error in attendance loop: %s", exc)
+    finally:
+        camera_svc.release()
+        _attendance_running = False
+        logger.info("[ATTENDANCE-LOOP] Camera released, attendance loop finished")
+        try:
+            await ws.send(json.dumps({
+                "type": "ATTENDANCE_COMPLETE",
+                "sessionId": session_id,
+                "jobId": job_id,
+                "recognizedCount": len(_recognized_students),
+            }))
+        except Exception:
+            pass
+
+
 async def _run_connection(ws_url: str, agent_id: str, token: str) -> None:
     """
     Manage one WebSocket connection lifecycle:
@@ -390,8 +535,9 @@ async def _run_connection(ws_url: str, agent_id: str, token: str) -> None:
     try:
         async with websockets.connect(
             ws_url,
-            ping_interval=None,       # we manage heartbeat manually
-            open_timeout=20,
+            ping_interval=20,         # Send standard WS ping every 20s to prevent Render drops
+            ping_timeout=20,
+            open_timeout=25,
             close_timeout=10,
             additional_headers={"X-Agent-Id": agent_id},
         ) as ws:
@@ -477,6 +623,47 @@ async def _run_connection(ws_url: str, agent_id: str, token: str) -> None:
                                 )
 
                         asyncio.create_task(_dispatch())
+
+                    elif msg_type == "ATTENDANCE_START":
+                        global _active_attendance_task, _attendance_running, _attendance_paused
+                        global _active_session_id, _active_job_id, _recognized_students
+
+                        session_id = msg.get("sessionId")
+                        job_id = msg.get("jobId", "")
+                        logger.info("[WS-AGENT] Received ATTENDANCE_START for session=%s jobId=%s", session_id, job_id)
+
+                        # Stop any previous task if still running
+                        if _active_attendance_task and not _active_attendance_task.done():
+                            _attendance_running = False
+                            _active_attendance_task.cancel()
+                            try:
+                                await _active_attendance_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
+
+                        _attendance_running = True
+                        _attendance_paused = False
+                        _active_session_id = session_id
+                        _active_job_id = job_id
+                        _recognized_students = set()
+
+                        _active_attendance_task = asyncio.create_task(
+                            _run_attendance_loop(ws, session_id, job_id)
+                        )
+
+                    elif msg_type in ("ATTENDANCE_PAUSE", "PAUSE"):
+                        _attendance_paused = True
+                        logger.info("[WS-AGENT] Attendance recognition PAUSED")
+
+                    elif msg_type in ("ATTENDANCE_RESUME", "RESUME"):
+                        _attendance_paused = False
+                        logger.info("[WS-AGENT] Attendance recognition RESUMED")
+
+                    elif msg_type in ("ATTENDANCE_STOP", "STOP"):
+                        logger.info("[WS-AGENT] Received ATTENDANCE_STOP")
+                        _attendance_running = False
+                        if _active_attendance_task and not _active_attendance_task.done():
+                            _active_attendance_task.cancel()
 
                     elif msg_type == "PING":
                         await ws.send(json.dumps({"type": "PONG", "agentId": agent_id}))
