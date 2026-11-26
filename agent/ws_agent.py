@@ -536,8 +536,8 @@ async def _run_connection(ws_url: str, agent_id: str, token: str) -> None:
     try:
         async with websockets.connect(
             ws_url,
-            ping_interval=None,
-            ping_timeout=None,
+            ping_interval=15,
+            ping_timeout=10,
             open_timeout=25,
             close_timeout=10,
             additional_headers={"X-Agent-Id": agent_id},
